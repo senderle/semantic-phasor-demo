@@ -1,0 +1,5 @@
+git+https://github.com/senderle/headless#egg=headless
+numpy
+umap-learn
+matplotlib
+spacy
