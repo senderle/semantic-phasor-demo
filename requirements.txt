@@ -3,3 +3,4 @@ numpy
 umap-learn
 matplotlib
 spacy
+pyhash
