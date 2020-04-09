@@ -77,6 +77,11 @@ class VectorTable():
         self._table = {}
         self._doc_count = Counter()
 
+        # If a spacy model with vectors is not available, 
+        # just use a random projection. This works surprisingly
+        # well, but gives vectors that are harder to interpret.
+        # Even when a spacy model is available, we still fall
+        # back on random vectors for out-of-vocabulary terms.
         if spacy_model is None:
             self._vec_table = self._srp_vec_table
         else:
