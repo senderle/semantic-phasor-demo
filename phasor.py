@@ -133,14 +133,12 @@ class VectorTable():
             for w in words
         ]
 
-        # Given a `multipier` value of 5, `hashes` is really a Vx5
-        # array of 64-byte integers, where V is the vocabulary size
-        # and
+        # Given a `multipier` value of 5, `hashes` is really a V x 5
+        # array of 64-bit integers, where V is the vocabulary size...
 
         hash_arr = numpy.array(hashes, dtype=numpy.uint64)
 
-        # But we could also think of it as an array of bytes,
-        # where every word is represented by 40 bytes...
+        # ...but we could also think of it as a V x 40 array of bytes...
 
         hash_arr = hash_arr.view(dtype=numpy.uint8)
 
@@ -149,6 +147,9 @@ class VectorTable():
 
         hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1,
                                                               64 * multiplier)
+        
+        # ...or as an array of floating point values, all equal to either
+        # 1.0 or 0.0, and truncated to give a final array of V x ndims.
 
         return (hash_arr.astype(numpy.float64) * 2 - 1)[:, :ndims]
 
