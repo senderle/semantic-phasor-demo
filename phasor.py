@@ -14,6 +14,7 @@ import umap
 from headless import load_pages
 from scipy.spatial import cKDTree
 from sklearn.neighbors import BallTree
+from sklearn.random_projection import GaussianRandomProjection
 from pyhash import city_64
 
 from bokeh.plotting import figure, show
@@ -77,7 +78,7 @@ class VectorTable():
         self._table = {}
         self._doc_count = Counter()
 
-        # If a spacy model with vectors is not available, 
+        # If a spacy model with vectors is not available,
         # just use a random projection. This works surprisingly
         # well, but gives vectors that are harder to interpret.
         # Even when a spacy model is available, we still fall
@@ -152,7 +153,7 @@ class VectorTable():
 
         hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1,
                                                               64 * multiplier)
-        
+
         # ...or as an array of floating point values, all equal to either
         # 1.0 or 0.0, and truncated to give a final array of V x ndims.
 
@@ -353,14 +354,85 @@ def load_fft_metadata(fft_path, metadata_path, start=0, end=None, reload=False,
     return fft_arr, metadata
 
 
-def deduplicator(data, **umap_kwargs):
-    data_umap = umap.UMAP(**umap_kwargs).fit_transform(data)
-    data_kd = cKDTree(data_umap)
+class Deduplicator:
+    def __init__(self, data, random=False, **umap_kwargs):
+        if isinstance(data, Deduplicator):
+            self.n_trees = data.n_trees
+            self.n_points = data.n_points
+            self.data = list(data.data)
+            self.data_umap = list(data.data_umap)
+            self.data_kd = list(data.data_kd)
+        else:
+            if random:
+                umap_kwargs = {k: umap_kwargs[k] for k in
+                               ['n_components']
+                               if k in umap_kwargs}
+                data_norm = data - data.mean(axis=0)
+                data_norm = data_norm / data_norm.std(axis=0)
+                data = data_norm
+                model = GaussianRandomProjection
+            else:
+                model = umap.UMAP
 
-    def deduplicate(distance):
-        pairs = data_kd.query_pairs(distance)
-        return set(frozenset(p) for p in pairs)
-    return deduplicate
+            self.n_trees = 1
+            self.n_points = len(data)
+            self.data = [data]
+            self.data_umap = [model(**umap_kwargs).fit_transform(d)
+                              for d in self.data]
+            self.data_kd = [cKDTree(d) for d in self.data_umap]
+
+    def merge(self, other):
+        if other.n_points != self.n_points:
+            raise ValueError(
+                'Deduplicator size mismatch: '
+                f'{self.n_points} != {other.n_points}'
+            )
+        self.data.extend(other.data)
+        self.data_umap.extend(other.data_umap)
+        self.data_kd.extend(other.data_kd)
+        self.n_trees += other.n_trees
+
+    def _get_pairs_simple(self, distance):
+        pairs = self.data_kd[0].query_pairs(distance)
+        pairs = set(frozenset(p) for p in pairs)
+        for kd in self.data_kd[1:]:
+            newpairs = set(frozenset(p) for p in kd.query_pairs(distance)
+                           if frozenset(p) in pairs)
+            pairs = newpairs
+        return pairs
+
+    def _get_pairs_onebatch(self, distance, batch):
+        data_umap = self.data_umap[0]
+        data_kd = self.data_kd[0]
+        pairs = data_kd.query_ball_point(data_umap[batch], distance)
+        pairs = set(frozenset((i, m)) for
+                    i, matches in zip(batch, pairs)
+                    for m in matches
+                    if m != i)
+        for t in range(1, self.n_trees):
+            data_umap = self.data_umap[t]
+            data_kd = self.data_kd[t]
+            newpairs = data_kd.query_ball_point(data_umap[batch], distance)
+            newpairs = set(frozenset((i, m)) for
+                           i, matches in zip(batch, newpairs)
+                           for m in matches
+                           if m != i)
+            pairs = set(p for p in newpairs if p in pairs)
+
+        return pairs
+
+    def _get_pairs_batched(self, distance, batchsize=1000):
+        indices = range(0, self.n_points)
+        batches = [list(indices[i: i + batchsize])
+                   for i in range(0, self.n_points, batchsize)]
+        pairs = self._get_pairs_onebatch(distance, batches[0])
+        for b in batches[1:]:
+            pairs.update(self._get_pairs_onebatch(distance, b))
+        return pairs
+
+    def __call__(self, distance):
+        # return self._get_pairs_simple(distance)
+        return self._get_pairs_batched(distance)
 
 
 def deduplicator_balltree(data, **umap_kwargs):
