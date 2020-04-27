@@ -32,6 +32,37 @@ def htid_url(htid):
 
 
 def path_to_htid(path):
+    """
+    Take a Path object or string with an HTID in its name, and extract
+    the HTID, undoing any substitutions done to avoid filename issues.
+    This should work for any filename with a single extension. Filenames
+    with multiple extensions ('.tar.gz') will not be handled correctly.
+    """
+    filename = os.path.split(path)[-1]
+
+    # All HTIDs have a library identifier and a
+    # record id, separated by a dot. We split them
+    # here to eliminate any possible ambiguity between
+    # this dot and additional optional dots signifying
+    # extensions.
+    lib_code, rec_id = filename.split('.', maxsplit=1)
+
+    # If there is an extension, remove it. This won't
+    # correctly handle extensions with multiple dots,
+    # unfortunately. If we were to assume that record
+    # ids, when transformed into filenames, never contain
+    # dots, then we could lsplit at the first dot. But
+    # that assumption needs to be verified.
+    rec_id = os.path.splitext(rec_id)[0]
+
+    # Finally, we undo the following substitutions
+    # applied to record ids to avoid filename issues.
+    rec_id = rec_id.replace('+', ':').replace('=', '/').replace(',', '.')
+
+    return f'{lib_code}.{rec_id}'
+
+
+def _path_to_htid_old(path):
     htid = os.path.split(path)[-1]
     htid = os.path.splitext(htid)[0]
     return htid.replace('+', ':').replace('=', '/').replace(',', '.')
@@ -307,7 +338,16 @@ def save_embedding_ffts(source_path, dest_path=None, srp=False):
                  for vp in new_paths]
     new_paths = [os.path.join(dest_path, vp) for vp in new_paths]
 
-    with multiprocessing.Pool(processes=2, maxtasksperchild=10) as pool:
+    # This step, though redundant, speeds up the multiprocessing stage
+    # dramatically sometimes, because it skips files that have already
+    # been processed without incurring any multiprocessing overhead.
+    filter = [(vp, np) for vp, np in zip(vol_paths, new_paths)
+              if not os.path.exists(np + '.npz')]
+    if not filter:
+        return []
+
+    vol_paths, new_paths = zip(*filter)
+    with multiprocessing.Pool(processes=8, maxtasksperchild=20) as pool:
         if srp:
             res = pool.imap_unordered(
                 _multiprocessing_save_srp,
