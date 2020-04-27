@@ -144,7 +144,7 @@ def parse_args():
 
     parser.add_argument(
         '-r',
-        'root',
+        '--root',
         type=str,
         default='.',
         help='The root working directory. Any paths that are not absolute '
@@ -153,7 +153,7 @@ def parse_args():
     )
     parser.add_argument(
         '-w',
-        'worksets',
+        '--worksets',
         type=str,
         default='worksets',
         help='The location of files contianing worksets. Worksets should '
@@ -163,7 +163,7 @@ def parse_args():
     )
     parser.add_argument(
         '-v',
-        'volumes',
+        '--volumes',
         type=str,
         default='volumes',
         help='The location of individual volume files. Volumes should be '
@@ -174,7 +174,7 @@ def parse_args():
     )
     parser.add_argument(
         '-d',
-        'derived',
+        '--derived',
         type=str,
         default='derived',
         help='The location of all derived vector data. Data will be saved '
