@@ -27,6 +27,10 @@ N_BANDS = 10
 
 
 def htid_url(htid):
+    """
+    Convert a given HTID to the corresponding volume page
+    in HathiTrust.
+    """
     htid = htid.replace('+', ':').replace('=', '/')
     return 'https://babel.hathitrust.org/cgi/pt?id={}'.format(htid)
 
@@ -34,7 +38,7 @@ def htid_url(htid):
 def path_to_htid(path):
     """
     Take a Path object or string with an HTID in its name, and extract
-    the HTID, undoing any substitutions done to avoid filename issues.
+    the HTID, undoing the substitutions performed for path conversion.
     This should work for any filename with a single extension. Filenames
     with multiple extensions ('.tar.gz') will not be handled correctly.
     """
@@ -47,13 +51,13 @@ def path_to_htid(path):
     # extensions.
     lib_code, rec_id = filename.split('.', maxsplit=1)
 
-    # If there is an extension, remove it. This won't
-    # correctly handle extensions with multiple dots,
-    # unfortunately. If we were to assume that record
-    # ids, when transformed into filenames, never contain
-    # dots, then we could lsplit at the first dot. But
-    # that assumption needs to be verified.
-    rec_id = os.path.splitext(rec_id)[0]
+    # If there is an extension, remove it. This assumes
+    # that record ids, after being transformed into filenames,
+    # will never contain dots. This appears to be true, but
+    # needs more verification. (The alternative, assuming
+    # that extensions do not contain multiple dots, will cause
+    # errors for extensions like `.tar.gz`.)
+    rec_id = rec_id.split('.', 1)[0]
 
     # Finally, we undo the following substitutions
     # applied to record ids to avoid filename issues.
@@ -62,6 +66,7 @@ def path_to_htid(path):
     return f'{lib_code}.{rec_id}'
 
 
+# This older version didn't always handle extensions correctly.
 def _path_to_htid_old(path):
     htid = os.path.split(path)[-1]
     htid = os.path.splitext(htid)[0]
@@ -69,10 +74,20 @@ def _path_to_htid_old(path):
 
 
 def htid_to_filename(htid):
+    """
+    Convert a given HTID into a filename, performing
+    substitutions on characters that can cause problems
+    in filenames. Note the removal of dots from the
+    rec_id but not the dot between the lib_code and
+    the rec_id. This makes it easier to distinguish
+    between extensions and dots that are part of the
+    original HTID.
+    """
+
     path = htid.replace(':', '+').replace('/', '=')
     if '.' in path:
-        head, tail = path.split('.', maxsplit=1)
-        path = '.'.join((head, tail.replace('.', ',')))
+        lib_code, rec_id = path.split('.', maxsplit=1)
+        path = '.'.join((lib_code, rec_id.replace('.', ',')))
     return path
 
 
