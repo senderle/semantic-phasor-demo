@@ -122,7 +122,7 @@ def compress_vols(dataset):
     curdir = os.getcwd()
     os.chdir(path)
     vols = [f for f in Path().iterdir()
-            if not f.suffix == '.zip' and
+            if f.is_dir() and
             not f.stem.startswith('.')]
     os.chdir(curdir)
 
@@ -193,7 +193,7 @@ if __name__ == '__main__':
     datasets = [dataset_re.match(f)['name'] for f in datasets]
     datasets = [Dataset(name, args.worksets, args.volumes, args.derived)
                 for name in datasets]
-    for ds in datasets:
-        write_remaining(ds)
-        compress_vols(ds)
-        save_embeddings(ds)
+    tasks = [write_remaining, compress_vols, save_embeddings]
+    for t in tasks:
+        for ds in datasets:
+            t(ds)
