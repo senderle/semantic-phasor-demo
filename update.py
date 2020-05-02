@@ -21,7 +21,9 @@
 
 import os
 import re
+import time
 import shutil
+import zipfile
 import argparse
 import multiprocessing
 
@@ -35,7 +37,8 @@ class Dataset:
         self.name = name
         self.fft_path = Path(args.derived) / Path(name) / Path('fft')
         self.srp_path = Path(args.derived) / Path(name) / Path('srp_fft')
-        self.vol_path = Path(args.volumes) / Path(name)
+        self.vol_path = Path(args.volumes) / Path(name) / Path('dir')
+        self.zip_path = Path(args.volumes) / Path(name) / Path('zip')
         self.id_file = Path(args.worksets) / Path(name + '-htids.txt')
 
         if not self.fft_path.exists():
@@ -44,36 +47,35 @@ class Dataset:
             self.srp_path.mkdir(parents=True)
         if not self.vol_path.exists():
             self.vol_path.mkdir(parents=True)
+        if not self.zip_path.exists():
+            self.zip_path.mkdir(parents=True)
 
 
-def volids_in(path, extension=None, exclude=None):
+def volids_in(path, extension=None):
     if extension is not None:
         return set(path_to_htid(v)
-                   for v in path.iterdir() if v.suffix == extension)
-    elif exclude is not None:
-        return set(path_to_htid(v)
-                   for v in path.iterdir() if v.suffix != exclude)
+                   for v in path.iterdir()
+                   if v.suffix == extension)
     else:
-        return set(path_to_htid(v) for v in path.iterdir())
+        return set(path_to_htid(v)
+                   for v in path.iterdir()
+                   if v.is_dir())
 
 
 def find_volids(dataset):
-    vec_fft = dataset.fft_path
-    vec_srp = dataset.srp_path
-    vol = dataset.vol_path
-
     all_ids = set()
+
     # Volumes must be in both fft and srp folders, or...
-    if vec_fft.is_dir():
+    if dataset.fft_path.is_dir():
         all_ids.update(volids_in(dataset.fft_path, extension='.npz'))
-    if vec_srp.is_dir():
+    if dataset.srp_path.is_dir():
         all_ids &= volids_in(dataset.srp_path, extension='.npz')
 
     # ...must be represented by a zip file or folder in volume folder.
-    if vol.is_dir():
+    if dataset.vol_path.is_dir():
+        all_ids.update(volids_in(dataset.vol_path))
+    if dataset.zip_path.is_dir():
         all_ids.update(volids_in(dataset.vol_path, extension='.zip'))
-    if vol.is_dir():
-        all_ids.update(volids_in(dataset.vol_path, exclude='.zip'))
     return all_ids
 
 
@@ -95,6 +97,15 @@ def write_remaining(dataset):
             op.write('\n')
 
 
+def valid_zip_file(f):
+    try:
+        with zipfile.ZipFile(f):
+            pass
+    except zipfile.BadZipFile:
+        return False
+    return True
+
+
 def compress(root_vol):
     root, vol = root_vol
     curdir = os.getcwd()
@@ -103,15 +114,23 @@ def compress(root_vol):
     zip_vol = zip_vol.with_suffix(zip_vol.suffix + '.zip')
     if not zip_vol.exists():
         shutil.make_archive(vol, 'zip', '.', vol)
+    else:
+        print(f'Zip file {zip_vol} already exists.')
 
-    if zip_vol.is_file():
-        # Boldly delete the original folder.
+    if zip_vol.is_file() and valid_zip_file(zip_vol):
         shutil.rmtree(vol)
         os.chdir(curdir)
         return True
     else:
+        if zip_vol.is_file():
+            os.remove(zip_vol)
+        print(f'Generating {zip_vol} failed.')
         os.chdir(curdir)
         return False
+
+
+def time_since_modified(f):
+    return time.time() - Path(f).stat().st_mtime
 
 
 def compress_vols(dataset):
@@ -121,19 +140,33 @@ def compress_vols(dataset):
 
     curdir = os.getcwd()
     os.chdir(path)
+
+    # Compress all non-hidden folders that have not been modified
+    # in the last five minutes. Since the htrc download process
+    # downloads multiple volumes in a single zip file, and then
+    # unpacks the zip file into the destination folder, this
+    # should allow more than enough time to be sure the volume
+    # has been fully downloaded.
     vols = [f for f in Path().iterdir()
             if f.is_dir() and
-            not f.stem.startswith('.')]
+            not f.stem.startswith('.') and
+            not (dataset.zip_path / f.name).is_file() and
+            time_since_modified(f) > 300]
     os.chdir(curdir)
 
-    with multiprocessing.Pool(processes=10, maxtasksperchild=20) as pool:
-        vol_args = [(path, f) for f in vols]
-        assert all(pool.imap_unordered(compress, vol_args))
+    if vols:
+        with multiprocessing.Pool(processes=10, maxtasksperchild=20) as pool:
+            vol_args = [(path, f) for f in vols]
+            list(pool.imap_unordered(compress, vol_args))
+
+    for f in path.iterdir():
+        if f.suffix == '.zip':
+            f.rename(dataset.zip_path / f.name)
 
 
 def save_embeddings(dataset):
-    save_embedding_ffts(dataset.vol_path, dataset.fft_path, srp=False)
-    save_embedding_ffts(dataset.vol_path, dataset.srp_path, srp=True)
+    save_embedding_ffts(dataset.zip_path, dataset.fft_path, srp=False)
+    save_embedding_ffts(dataset.zip_path, dataset.srp_path, srp=True)
 
 
 def parse_args():
@@ -193,7 +226,14 @@ if __name__ == '__main__':
     datasets = [dataset_re.match(f)['name'] for f in datasets]
     datasets = [Dataset(name, args.worksets, args.volumes, args.derived)
                 for name in datasets]
-    tasks = [write_remaining, compress_vols, save_embeddings]
-    for t in tasks:
-        for ds in datasets:
-            t(ds)
+
+    tasks = [
+        (write_remaining, 'Collecting remaining volumes'),
+        (compress_vols, 'Compressing volumes'),
+        (save_embeddings, 'Saving embeddings'),
+    ]
+
+    for ds in datasets:
+        for task, desc in tasks:
+            print(f' ** {desc} for {ds.name}.')
+            task(ds)
