@@ -233,7 +233,7 @@ if __name__ == '__main__':
         (save_embeddings, 'Saving embeddings'),
     ]
 
-    for ds in datasets:
-        for task, desc in tasks:
+    for task, desc in tasks:
+        for ds in datasets:
             print(f' ** {desc} for {ds.name}.')
             task(ds)
