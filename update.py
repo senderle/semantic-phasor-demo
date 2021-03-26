@@ -81,7 +81,7 @@ def find_volids(dataset):
 
 def load_volids(id_file):
     with open(id_file) as ip:
-        return set(l.strip() for l in ip)
+        return set(line.strip() for line in ip)
 
 
 def remaining_volids(dataset):
