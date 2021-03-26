@@ -218,8 +218,7 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == '__main__':
-    args = parse_args()
+def update_vectors(args):
     dataset_re = re.compile('(?P<name>^.+)-htids.txt$')
     datasets = os.listdir(args.worksets)
     datasets = [f for f in datasets if dataset_re.match(f)]
@@ -237,3 +236,8 @@ if __name__ == '__main__':
         for ds in datasets:
             print(f' ** {desc} for {ds.name}.')
             task(ds)
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    update_vectors(args)
