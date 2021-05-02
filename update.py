@@ -1,23 +1,25 @@
-# This script examines the contents of three directories in the current
-# working folder, `workset-ids`, `volumes`, and `derived`, automatically
-# generates lists of volume ids for volumes that still need to be downloaded,
-# compresses uncompressed volume, and generates derived document vectors.
+"""
+This script examines the contents of three directories in the current
+working folder, `workset-ids`, `volumes`, and `derived`, automatically
+generates lists of volume ids for volumes that still need to be downloaded,
+compresses uncompressed volume, and generates derived document vectors.
 
-# In detail, it follows these steps:
-#
-# 1. For every file it sees in `workset-ids` matching a particular regex
-# (see below) it infers the existence of a dataset with the corresponding name.
-# 2. For a given dataset it looks in the corresponding folder inside `volumes`
-# and collects the ids of all the volumes there, whether saved as folders
-# full of uncompressed text files or as compressed zip files.
-# 3. It also looks in the corresponding folder inside
-# `derived`, and collects those ids.
-# 3. It then saves a list of the ids not represented in either the `volumes`
-# or `derived` folders.
-# 4. Next, it looks inside `volumes` and compresses any uncompressed folders.
-# 5. Then it generates derived document vecors for any new volumes in
-# `volumes`.
-# 6. It repeats 2-5 for each dataset found at step 1.
+In detail, it follows these steps:
+
+1. For every file it sees in `workset-ids` matching a particular regex
+(see below) it infers the existence of a dataset with the corresponding name.
+2. For a given dataset it looks in the corresponding folder inside `volumes`
+and collects the ids of all the volumes there, whether saved as folders
+full of uncompressed text files or as compressed zip files.
+3. It also looks in the corresponding folder inside
+`derived`, and collects those ids.
+3. It then saves a list of the ids not represented in either the `volumes`
+or `derived` folders.
+4. Next, it looks inside `volumes` and compresses any uncompressed folders.
+5. Then it generates derived document vecors for any new volumes in
+`volumes`.
+6. It repeats 2-5 for each dataset found at step 1.
+"""
 
 import os
 import re
@@ -33,13 +35,13 @@ from phasor import save_embedding_ffts, path_to_htid
 
 
 class Dataset:
-    def __init__(self, name, worksets, volumes, derived):
+    def __init__(self, name, root, worksets, volumes, derived):
         self.name = name
-        self.fft_path = Path(args.derived) / Path(name) / Path('fft')
-        self.srp_path = Path(args.derived) / Path(name) / Path('srp_fft')
-        self.vol_path = Path(args.volumes) / Path(name) / Path('dir')
-        self.zip_path = Path(args.volumes) / Path(name) / Path('zip')
-        self.id_file = Path(args.worksets) / Path(name + '-htids.txt')
+        self.fft_path = Path(root) / derived / name / 'fft'
+        self.srp_path = Path(root) / derived / name / 'srp_fft'
+        self.vol_path = Path(root) / volumes / name / 'dir'
+        self.zip_path = Path(root) / volumes / name / 'zip'
+        self.id_file = Path(root) / worksets / (name + '-htids.txt')
 
         if not self.fft_path.exists():
             self.fft_path.mkdir(parents=True)
@@ -180,9 +182,8 @@ def parse_args():
         '--root',
         type=str,
         default='.',
-        help='The root working directory. Any paths that are not absolute '
-        'will be interpreted as relative to this directory. Defaults to '
-        'the current working directory.'
+        help='The root working directory. All other paths are relative to '
+        'this directory. Defaults to the current working directory. '
     )
     parser.add_argument(
         '-w',
@@ -220,11 +221,13 @@ def parse_args():
 
 def update_vectors(args):
     dataset_re = re.compile('(?P<name>^.+)-htids.txt$')
-    datasets = os.listdir(args.worksets)
+    datasets = os.listdir(Path(args.root) / args.worksets)
     datasets = [f for f in datasets if dataset_re.match(f)]
     datasets = [dataset_re.match(f)['name'] for f in datasets]
-    datasets = [Dataset(name, args.worksets, args.volumes, args.derived)
-                for name in datasets]
+    datasets = [
+        Dataset(name, args.root, args.worksets, args.volumes, args.derived)
+        for name in datasets
+    ]
 
     tasks = [
         (write_remaining, 'Collecting remaining volumes'),
