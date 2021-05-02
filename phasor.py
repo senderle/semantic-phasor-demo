@@ -15,6 +15,7 @@ from headless import load_pages
 from scipy.spatial import cKDTree
 from sklearn.neighbors import BallTree
 from sklearn.random_projection import GaussianRandomProjection
+from sklearn.preprocessing import StandardScaler
 from pyhash import city_64
 
 from bokeh.plotting import figure, show
@@ -108,10 +109,11 @@ def volume_paths(path):
     return [f for f in files if os.path.isdir(f) or f.endswith('.zip')]
 
 
-def numpy_paths(path):
+def numpy_paths(path, n=None):
     """List all numpy files in the given folder."""
     files = (os.path.join(path, f) for f in sorted(os.listdir(path)))
-    return [f for f in files if f.endswith('.npz')]
+    files = [f for f in files if f.endswith('.npz')]
+    return files if n is None else files[:n]
 
 
 # There are surely faster ways to tokenize, look up word vectors,
@@ -273,17 +275,36 @@ def load_compact_fft(filename, ndims=300):
         i = fft_data['imag']
     fft = numpy.empty(r.shape, dtype=numpy.complex64)
     fft[:] = r
-    fft[:, 1:] += i
+    fft[:, 1:] += i * 1j
     return fft
 
 
-def flatten_fft(emb_fft, start=0, end=None, drop_zero_imag=False):
-    """Reshape an fft array into a single vector."""
+def flatten_fft(emb_fft, start=0, end=None, drop_imag=False):
+    """
+    Transform a 2-d array of complex numbers into a vector of
+    ordinary floats by unpacking the real and imaginary components
+    and flattening the array.
+
+    `emb_fft` is a two-dimensional, complex-valued array. Each row
+    is an array of complex amplitudes for a given semantic dimension.
+    Each column corresponds to a frequency band, starting with
+    the frequency 0 band (a scalar offset around which the signal
+    oscillates), the frequency 1 band (which completes one cycle
+    over the duration of the signal), the frequency 2 band (which
+    completes two cycles), and so on.
+
+    `start` and `end` determine how many frequency bands to pull
+    intp the vector.
+
+    `drop_imag` drops the imaginary values instead of unpacking
+    them when pulling only the first frequency band. The first
+    band is a scalar offset around which the signal oscillates.
+    For real signals, the imaginary offset is always zero, and
+    can be ignored.
+    """
     complex_vec = numpy.array(emb_fft)[:, start:end].reshape(-1)
 
-    # Check to see if all imaginary values are zero,
-    # and if so only include real
-    if drop_zero_imag and complex_vec.imag.ravel().sum() == 0:
+    if drop_imag and start == 0 and end == 1:
         return complex_vec.real
     else:
         return numpy.array([x
@@ -301,9 +322,9 @@ def unflatten_vec(doc_vector, ndims=300):
     return real + imag * 1j
 
 
-def slice_vec_bands(doc_vectors, start=0, end=None):
+def slice_vec_bands(doc_vectors, start=0, end=None, drop_imag=False):
     return numpy.array([
-        flatten_fft(unflatten_vec(dv), start, end, drop_zero_imag=True)
+        flatten_fft(unflatten_vec(dv), start, end, drop_imag)
         for dv in doc_vectors
     ])
 
@@ -376,24 +397,27 @@ def save_embedding_ffts(source_path, dest_path=None, srp=False):
         return list(res)
 
 
-def load_embedding_fft_array(path, start=0, end=None,
-                             reload=False, htid_test=None, _cache={}):
+def load_embedding_fft_array(path, start=0, end=None, reload=False,
+                             htid_test=None, n_docs=None, _cache={}):
     if (reload or not _cache or _cache['start'] != start or
-            _cache['end'] != end or htid_test is not None):
+            _cache['end'] != end or htid_test is not None or
+            _cache['n_docs'] != n_docs):
         if htid_test is not None:
-            assert ([path_to_htid(p) for p in numpy_paths(path)] ==
+            assert ([path_to_htid(p) for p in numpy_paths(path, n=n_docs)] ==
                     list(htid_test))
         _cache['start'] = start
         _cache['end'] = end
+        _cache['n_docs'] = n_docs
         _cache['data'] = numpy.array(
                 [flatten_fft(load_compact_fft(f), start, end)
-                 for f in numpy_paths(path)])
+                 for f in numpy_paths(path, n=n_docs)])
     return _cache['data']
 
 
-def load_metadata(metadata_path, fft_path, csv_delim='\t', htid_col='htid'):
+def load_metadata(metadata_path, fft_path, csv_delim='\t', htid_col='htid',
+                  n_docs=None):
     ids = [path_to_htid(p)
-           for p in numpy_paths(fft_path)]
+           for p in numpy_paths(fft_path, n=n_docs)]
     metadata = (pandas
                 .read_csv(metadata_path, delimiter=csv_delim)
                 .drop_duplicates(htid_col)
@@ -402,15 +426,152 @@ def load_metadata(metadata_path, fft_path, csv_delim='\t', htid_col='htid'):
 
 
 def load_fft_metadata(fft_path, metadata_path, start=0, end=None, reload=False,
-                      csv_delim='\t', htid_col='htid'):
-    metadata = load_metadata(metadata_path, fft_path, csv_delim, htid_col)
+                      csv_delim='\t', htid_col='htid', n_docs=None):
+    metadata = load_metadata(metadata_path, fft_path,
+                             csv_delim, htid_col, n_docs=n_docs)
     fft_arr = load_embedding_fft_array(fft_path, start, end,
-                                       reload, metadata.index)
+                                       reload, metadata.index, n_docs=n_docs)
     return fft_arr, metadata
 
 
+class PhasorSignature:
+    def __init__(self, *, n_components=10, n_anchors=3):
+        self.n_components = n_components
+        self.n_anchors = n_anchors
+        self.scaler = StandardScaler()
+        self._argshuf = []
+
+    def stable_shuffle(self, seq):
+        """
+        Choose a random permutation based on the input length of the
+        seuqence, and apply that permutation to all inputs of that length.
+        Should be stable across runs, but not guaranteed to be stable
+        across numpy versions. (TODO: Fix that.)
+        """
+        seq = numpy.asarray(seq)
+        if len(seq) != len(self._argshuf):
+            # Reset the rng using seq length as the seed.
+            # Why not just use the same seed every time? Dunno.
+            rng = numpy.random.default_rng(len(seq))
+            # Save the first permutation generated thereby.
+            self._argshuf = rng.permutation(len(seq))
+        return seq[self._argshuf]
+
+    def mag(self, c):
+        return (c * c.conjugate()) ** 0.5
+
+    def norm(self, c):
+        mag = self.mag(c)
+        mag = mag if mag > 0 else 1
+        return c / mag
+
+    def n_centroids(self, phasors, n):
+        phasors = self.stable_shuffle(phasors)
+        centroids = []
+        for start in range(n):
+            span = [phasors[i] for i in range(start, len(phasors), n)]
+            centroids.append(sum(span) / len(span))
+        return centroids
+
+    def signature(self, phasors):
+        """
+        Create a signature based on a phasor blob.
+
+        To develop an intuition for how this works, picture a set
+        of phasors as a bivariate normal distribution -- in other
+        words, a roundish blob of points.
+
+        What effects do front-matter, end-matter, and OCR errors
+        have on that blob? Based on the properties of phasors, we
+        can describe them in terms of two distinct actions on the
+        blob: rotation and perturbation.
+
+        The rotation is caused by the addition of front- and end-matter.
+        Those additions shift the bulk of the body text forward or
+        backward, and phasors represent that shift as a rotation.
+        So our phasor blob rotates around the origin as front- and
+        end-matter is added.
+
+        The perturbation is caused by error of various kinds, and by
+        the content of the front- and end-matter. These textual
+        variations slightly modify the way the Fourier transform
+        breaks down the semantic structure of the documents.
+        The result is that the phasors get bumped about a bit.
+
+        To identify duplicates, we want to find a way to undo
+        these two actions. Strictly speaking, of course, this is
+        impossible. However, we can come close.
+
+        Let's begin with the noise. We don't know exactly how the
+        phasors get bumped about, but let's cross our fingers and
+        hope that it's in a way that is essentially random and
+        independent. If that's the case, then the noise has a
+        useful property: if you add it up, the sum will tend
+        towards zero. That's because the jitter is as likely to
+        push points in one direction as in any other. In the
+        aggregate, it all cancels itself out. So even though
+        we can't restore any one phasor to its original location,
+        we can take the average of many phasors, and the result
+        will be very close to what it would have been before
+        the noise was added.
+
+        If we use this strategy, and combine it with the strategy
+        of picking the most pronounced outliers in the blob --
+        the phasors that are furthest from the origin -- we can
+        create an anchor phasor. For two phasor blobs that come
+        from the same source text, that anchor phasor will have
+        nearly the same position relative to the other phasors
+        in the blob. So we can measure the position of other
+        phasors relative to that anchor to get a stable signature.
+
+        -------------------
+
+        Some strategies to test:
+
+          maybe a single outlier can just be the anchor
+          maybe it should be just another stable choice, not necessarily
+            outliers
+          maybe we should be averaging together points at every
+            step -- not just at the anchor step but for each signature
+            dimension
+          maybe there are properties of the individual semantic
+            dimensions that make them better or worse suited for
+            this
+
+
+        """
+        phasors = phasors.reshape(-1)
+
+        top_mag = sorted(phasors, key=self.mag)[-self.n_anchors:]
+        centroid = sum(top_mag) / self.n_anchors
+        offset = self.norm(centroid)
+        offset = 1 if offset == 0 else offset
+
+        signature = [c / offset for c in phasors]
+        signature = self.n_centroids(signature, self.n_components // 2 + 1)
+        signature = [x for c in signature for x in (c.real, c.imag)]
+        return numpy.array(signature[:self.n_components])
+
+    def fit_transform(self, data):
+        signatures = self._transform_unscaled(data)
+        return self.scaler.fit_transform(signatures)
+
+    def fit(self, data):
+        self.fit_transform(data)
+        return self
+
+    def _transform_unscaled(self, data):
+        unflattened = [unflatten_vec(d) for d in data]
+        return numpy.array([self.signature(uf)
+                            for uf in unflattened])
+
+    def transform(self, data):
+        signatures = self._transform_unscaled(data)
+        return self.scaler.transform(signatures)
+
+
 class Deduplicator:
-    def __init__(self, data, random=False, **umap_kwargs):
+    def __init__(self, data, random=False, signature=False, **umap_kwargs):
         if isinstance(data, Deduplicator):
             self.n_trees = data.n_trees
             self.n_points = data.n_points
@@ -418,14 +579,25 @@ class Deduplicator:
             self.data_umap = list(data.data_umap)
             self.data_kd = list(data.data_kd)
         else:
-            if random:
+            if random or signature:
                 umap_kwargs = {k: umap_kwargs[k] for k in
                                ['n_components']
                                if k in umap_kwargs}
+
+                # It would be more polite to use sklearn's built-in
+                # scaling function, `sklearn.preprocessing.scale`.
+                # But that function dutifully issues warnings every
+                # time our oddball HathiTrust data causes numerical
+                # issues, and those warnings clutter up our notebooks.
                 data_norm = data - data.mean(axis=0)
-                data_norm = data_norm / data_norm.std(axis=0)
-                data = data_norm
-                model = GaussianRandomProjection
+                data_std = data_norm.std(axis=0)
+                data_std[data_std == 0] = 1
+                data_norm = data_norm / data_std
+
+                if random:
+                    model = GaussianRandomProjection
+                else:
+                    model = PhasorSignature
             else:
                 model = umap.UMAP
 
