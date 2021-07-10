@@ -15,7 +15,7 @@ from headless import load_pages
 from scipy.spatial import cKDTree
 from sklearn.neighbors import BallTree
 from sklearn.random_projection import GaussianRandomProjection
-from sklearn.preprocessing import StandardScaler
+# from sklearn.preprocessing import StandardScaler
 from pyhash import city_64
 
 from bokeh.plotting import figure, show
@@ -36,53 +36,42 @@ def htid_url(htid):
     return 'https://babel.hathitrust.org/cgi/pt?id={}'.format(htid)
 
 
-def path_to_htid(path):
-    """
-    Take a Path object or string with an HTID in its name, and extract
-    the HTID, undoing the substitutions performed for path conversion.
-    This should work for any filename with a single extension. Filenames
-    with multiple extensions ('.tar.gz') will not be handled correctly.
-    """
-    filename = os.path.split(path)[-1]
-
-    # All HTIDs have a library identifier and a
-    # record id, separated by a dot. We split them
-    # here to eliminate any possible ambiguity between
-    # this dot and additional optional dots signifying
-    # extensions.
-    lib_code, rec_id = filename.split('.', maxsplit=1)
-
-    # If there is an extension, remove it. This assumes
-    # that record ids, after being transformed into filenames,
-    # will never contain dots. This appears to be true, but
-    # needs more verification. (The alternative, assuming
-    # that extensions do not contain multiple dots, will cause
-    # errors for extensions like `.tar.gz`.)
-    rec_id = rec_id.split('.', 1)[0]
-
-    # Finally, we undo the following substitutions
-    # applied to record ids to avoid filename issues.
-    rec_id = rec_id.replace('+', ':').replace('=', '/').replace(',', '.')
-
-    return f'{lib_code}.{rec_id}'
-
-
-# This older version didn't always handle extensions correctly.
-def _path_to_htid_old(path):
-    htid = os.path.split(path)[-1]
-    htid = os.path.splitext(htid)[0]
-    return htid.replace('+', ':').replace('=', '/').replace(',', '.')
-
-
 def htid_to_filename(htid):
     """
-    Convert a given HTID into a filename, performing
-    substitutions on characters that can cause problems
-    in filenames. Note the removal of dots from the
-    rec_id but not the dot between the lib_code and
-    the rec_id. This makes it easier to distinguish
-    between extensions and dots that are part of the
-    original HTID.
+    Convert a given HTID into a valid filename, performing substitutions
+    on characters that can cause problems in various filesystems and URI
+    schemes. This is a surprisingly subtle process because it needs to
+    be reversible -- that is, we need to generate a filename that can be
+    converted back into an HTID. But depending on how the substitutions
+    are performed, they may cause collisions by assigning two distinct
+    volumes the same filename. (This probably doesn't become a problem
+    immediately. But later, when file extensions are added in ways that
+    cause ambiguity, it does.)
+
+    Fortunately most substitutions are trivial, and we begin with those.
+    Colons are replaced by plus signs, and slashes are replaced by equal
+    signs. So for example, the sequence `://` will become `+==`.
+
+    The non-trivial substitutions involve periods ("dots"). These can
+    appear in both HTIDs and filenames, and can have different meanings
+    depending on where they occur. The upshot is that we need to perform
+    our substitutions in a particular order.
+
+    An HTID consists of 1) a library code, identifying the library a
+    volume came from, and 2) a record id, identifying the volume itself.
+    These are joined by a dot. And since library codes cannot contain
+    dots, the first dot we encounter is guaranteed to be a separator
+    between the library code and the record id. So we start there,
+    splitting at the dot to divide the HTID into two parts.
+
+    We name these `lib_code` and `rec_id`. The `lib_code` needs no
+    further processing. The `rec_id` may contain additional dots,
+    depending on each library's own record id scheme. These we replace
+    with commas.
+
+    Finally, we rejoin the code and id with a dot.
+
+    This process is reversed by `path_to_htid`.
     """
 
     path = htid.replace(':', '+').replace('/', '=')
@@ -90,6 +79,43 @@ def htid_to_filename(htid):
         lib_code, rec_id = path.split('.', maxsplit=1)
         path = '.'.join((lib_code, rec_id.replace('.', ',')))
     return path
+
+
+def path_to_htid(path):
+    """
+    Take a Path object or string with an HTID in its name, and extract
+    the HTID, undoing the substitutions performed for path conversion.
+    This should work for any filename with a single extension. Filenames
+    with multiple extensions ('.tar.gz') may not be handled correctly.
+    More corner cases need testing.
+
+    For a more extensive discussion of the substitutions being reversed
+    here, and the rationale for them, see the documentation for
+    `htid_to_filename`.
+
+    The first dot is guaranteed to be a separator between a library code
+    and a record id. The next dot we encounter is in the record id, and
+    is guaranteed to be a separator between the record id itself and the
+    first of any number of filename extensions (if present).
+
+    We have these guarantees because of the care taken in
+    `htid_to_filename` to create a fully reversible substitution process.
+    """
+
+    # Drop the leading path.
+    filename = os.path.split(path)[-1]
+
+    # Split the library code and record id.
+    lib_code, rec_id = filename.split('.', maxsplit=1)
+
+    # Drop any file extensions.
+    rec_id = rec_id.split('.', 1)[0]
+
+    # Undo the remaining character substitutions.
+    rec_id = rec_id.replace('+', ':').replace('=', '/').replace(',', '.')
+
+    # Reunite the library code and record id.
+    return f'{lib_code}.{rec_id}'
 
 
 def test_htid_conversion(path):
@@ -122,6 +148,14 @@ def numpy_paths(path, n=None):
 # up adding 30-50% more time. The combination of flexibility and
 # high quality tokenization is worth the extra time.
 class VectorTable():
+    """
+    A lookup table for getting vectors from tokens. Uses either a
+    `spacy` model with random vectors for out-of-vocbulary terms,
+    or a purely random projection.
+
+    Probably not very efficient, but the lack of fast hash tables
+    with c-speed vectorized lookup stymies progress.
+    """
     def __init__(self, spacy_model=None, ndims=300):
         self._table = {}
         self._doc_count = Counter()
@@ -151,10 +185,10 @@ class VectorTable():
         # speed, memory usage, and flexibility.
         table = self._vec_table(keys)
 
-        # To save memory and a bit of speed, the table
-        # only contains indices underlying vector tables.
-        # The data is copied only once, directly into the
-        # new array.
+        # To save memory and speed things up a little, the
+        # table only contains indices into the underlying
+        # vector tables. The data is copied only once,
+        # directly into the new array.
         result = numpy.empty((len(keys), self.ndims))
         for i, k in enumerate(keys):
             sub_index, sub_table = table[k]
@@ -176,10 +210,26 @@ class VectorTable():
         srp = self.srp_matrix(keys, self.ndims)
         return {k: (i, srp) for i, k in enumerate(keys)}
 
-    # This is a quick-and-dirty implementation of what Ben Schmidt calls
-    # "Stable Random Projection." (Errors are mine, not his!)
     @classmethod
     def srp_matrix(cls, words, ndims, _hashfunc=city_64(0)):
+        """
+        Geenrate a random matrix using a hash function. It will have
+        `ndims` columns, and a row for every word, for a total of
+        `len(words)` rows. The values will be determined by a hash
+        function. To create a row, we hash the corresponding word
+        with a tag appended, change the tag and hash it a second time,
+        and continue until we have more than `ndims` random bits
+        available. The hash values are then unpacked into a matrix
+        of bits, and the 0s are changed to -1s (so that the matrix
+        approximately preserves length when used for projection).
+
+        Because we use a hash function pre-seeded with a fixed value,
+        a given word will always generate the same row of numbers.
+
+        This is a hasty implementation of Ben Schmidt's Stable Random
+        Projection (https://culturalanalytics.org/article/11033).
+        Errors are mine alone.
+        """
         multiplier = (ndims - 1) // 64 + 1
         hashes = [
             list(map(_hashfunc, ['{}_{}'.format(w, i)
@@ -217,7 +267,7 @@ def load_one_sp_embedding(volume_path, nlp=en_nlp,
 
 
 def load_one_srp_embedding(volume_path, nlp=en_nlp, vec=VectorTable()):
-    """Parse the text of one volume and extract word vectors."""
+    """Parse the text of one volume and extract SRP word vectors."""
     sp_text = nlp.pipe(load_pages(volume_path))
     return vec[[tok.lower_ for doc in sp_text for tok in doc
                 if not tok.is_space and not tok.is_punct]]
@@ -263,20 +313,89 @@ def embedding_fft(sp_embedding, n_bands=N_BANDS):
 
 
 def save_compact_fft(filename, fft):
+    """
+    Save the output of a series of fast Fourier transforms by
+    unpacking the real and imaginary parts into separate arrays, and
+    saving them as an `.npz` file. The result is a file with two
+    2-d arrays, corresponding to a single HathiTrust volume. The
+    rows of the arrays are semantic dimensions, and the columns of
+    the arrays are frequecy bands.
+
+    We currently save the data as `float16` values, which saves some
+    disk space, but does throw out some information. See the
+    documetation for `load_compact_fft` for further discussion of
+    this issue.
+    """
     r = fft.real.astype(numpy.float16)
     i = fft.imag[:, 1:].astype(numpy.float16)
+
+    # The first imaginary band is always be zero for a real signal.
+    # So we don't bother saving it -- but we check to make sure we
+    # aren't making some kind of mistake and throwing out data.
     assert (fft.imag[:, 0] == 0).all()
     numpy.savez_compressed(filename, real=r, imag=i)
 
 
 def load_compact_fft(filename, ndims=300):
+    """
+    Load the data from a fast Fourier transform, as produced by the
+    `save_compact_fft` function. For type consistency, we load these
+    as `complex128` values, even though they were saved as two
+    `float16` values. This wastes some memory, and in the future,
+    it might make sense to save the FFT outputs as `float64` values.
+
+    However, it could be that the extra information doesn't affect
+    the behavior of these vectors at all, and provide no benefit.
+    This should be tested at some point.
+    """
     with numpy.load(filename) as fft_data:
         r = fft_data['real']
         i = fft_data['imag']
-    fft = numpy.empty(r.shape, dtype=numpy.complex64)
+    fft = numpy.empty(r.shape, dtype=numpy.complex128)
     fft[:] = r
     fft[:, 1:] += i * 1j
     return fft
+
+
+def load_compact_fft_as_signature(
+        filename, n_components=10, n_anchors=3, _cache={}):
+    """
+    Load the data from a fast Fourier transform, as produced by the
+    `save_compact_fft` function. Initialy, this behaves identically
+    to `load_compact_fft`. However, instead of returning the full
+    data from the FFT transform, it returns a much smaller signature
+    vector for each frequency band, using the PhasorSignature class.
+
+    This could probably be sped up.
+    """
+    with numpy.load(filename) as fft_data:
+        r = fft_data['real']
+        i = fft_data['imag']
+    fft = numpy.empty(r.shape, dtype=numpy.complex128)
+    fft[:] = r
+    fft[:, 1:] += i * 1j
+
+    cache_valid = (_cache and
+                   _cache['n_components'] == n_components and
+                   _cache['n_anchors'] == n_anchors and
+                   'psig' in _cache)
+    if not cache_valid:
+        _cache['psig'] = PhasorSignature(n_components=n_components,
+                                         n_anchors=n_anchors)
+        _cache['n_components'] = n_components
+        _cache['n_anchors'] = n_anchors
+
+    psig = _cache['psig']
+
+    rows, cols = fft.shape
+    signature_bands = numpy.empty((n_components // 2, cols),
+                                  dtype=numpy.complex128)
+    for band in range(cols):
+        sig = psig.signature(fft[:, band])
+        signature_bands[:, band] = sig[::2]
+        signature_bands[:, band] += sig[1::2] * 1j
+
+    return signature_bands
 
 
 def flatten_fft(emb_fft, start=0, end=None, drop_imag=False):
@@ -288,10 +407,10 @@ def flatten_fft(emb_fft, start=0, end=None, drop_imag=False):
     `emb_fft` is a two-dimensional, complex-valued array. Each row
     is an array of complex amplitudes for a given semantic dimension.
     Each column corresponds to a frequency band, starting with
-    the frequency 0 band (a scalar offset around which the signal
-    oscillates), the frequency 1 band (which completes one cycle
-    over the duration of the signal), the frequency 2 band (which
-    completes two cycles), and so on.
+    the frequency 0 band, a scalar offset around which the signal
+    oscillates; the frequency 1 band, which completes one cycle
+    over the duration of the signal; the frequency 2 band, which
+    completes two cycles over the duration of the signal; and so on.
 
     `start` and `end` determine how many frequency bands to pull
     intp the vector.
@@ -302,6 +421,7 @@ def flatten_fft(emb_fft, start=0, end=None, drop_imag=False):
     For real signals, the imaginary offset is always zero, and
     can be ignored.
     """
+
     complex_vec = numpy.array(emb_fft)[:, start:end].reshape(-1)
 
     if drop_imag and start == 0 and end == 1:
@@ -313,18 +433,33 @@ def flatten_fft(emb_fft, start=0, end=None, drop_imag=False):
 
 
 def unflatten_vec(doc_vector, ndims=300):
-    """Turn a document vector back into an fft array."""
+    """
+    Turn a document vector back into an fft array. Roughly speaking,
+    this is the inverse of `flatten_fft`. Note that we need to know
+    the number of dimensions to get the right shape for the array.
 
-    # This hard-codes values that should be parameters.
+    The resulting array is a 2-d array of complex numbers, as expected
+    by `flatten_fft`.
+    """
+
     array = doc_vector.reshape(ndims, -1)
     real = array[:, ::2]
     imag = array[:, 1::2]
     return real + imag * 1j
 
 
-def slice_vec_bands(doc_vectors, start=0, end=None, drop_imag=False):
+def slice_vec_bands(doc_vectors, start=0, end=None,
+                    ndims=300, drop_imag=False):
+    """
+    This takes a whole batch of document vectors and slices out a
+    subset of their frequency bands. It does so by turning them back
+    into FFT arrays, pulling out the specific bands we want, and
+    re-flattening them. When start is `0`, end is `None`, and
+    drop_imag=False, this amounts to the identity function on doc
+    vectors.
+    """
     return numpy.array([
-        flatten_fft(unflatten_vec(dv), start, end, drop_imag)
+        flatten_fft(unflatten_vec(dv, ndims=ndims), start, end, drop_imag)
         for dv in doc_vectors
     ])
 
@@ -335,6 +470,7 @@ def test_fft_reshape(volume_path, srp=False):
 
 
 def _test_fft_reshape_one(folder, srp):
+    """A helper function for testing vector-array conversion"""
     if srp:
         emb = load_one_srp_embedding(folder)
     else:
@@ -347,6 +483,11 @@ def _test_fft_reshape_one(folder, srp):
 
 
 def _multiprocessing_save_sp(in_out_path):
+    """
+    A function that saves spacy embeddings and is suitable for use
+    with the multiprocessing library because it is globally namespaced
+    and accepts just one argument as input.
+    """
     vp, np = in_out_path
     if not os.path.exists(np + '.npz'):
         save_compact_fft(
@@ -357,6 +498,11 @@ def _multiprocessing_save_sp(in_out_path):
 
 
 def _multiprocessing_save_srp(in_out_path):
+    """
+    A function that loads SRP embeddings and is suitable for use
+    with the multiprocessing library because it is globally namespaced
+    and accepts just one argument as input.
+    """
     vp, np = in_out_path
     if not os.path.exists(np + '.npz'):
         save_compact_fft(
@@ -367,6 +513,10 @@ def _multiprocessing_save_srp(in_out_path):
 
 
 def save_embedding_ffts(source_path, dest_path=None, srp=False):
+    """
+    A function that saves embedding FFT arrays for each volume, using
+    multiprocessing to speed things up.
+    """
     dest_path = source_path if dest_path is None else dest_path
     vol_paths = volume_paths(source_path)
     new_paths = [os.path.split(vp)[-1] for vp in vol_paths]
@@ -398,11 +548,18 @@ def save_embedding_ffts(source_path, dest_path=None, srp=False):
 
 
 def load_embedding_fft_array(path, start=0, end=None, reload=False,
-                             htid_test=None, n_docs=None, _cache={}):
-    if (reload or not _cache or _cache['start'] != start or
-            _cache['end'] != end or htid_test is not None or
-            _cache['n_docs'] != n_docs):
-        if htid_test is not None:
+                             htid_test=False, n_docs=None, _cache={}):
+    """
+    Quickly load embedding fft data, using a cache if nothing about
+    the input arguments has changed.
+    """
+
+    reload = (reload or not _cache or _cache['start'] != start or
+              _cache['end'] != end or htid_test or
+              _cache['n_docs'] != n_docs)
+    if reload:
+        print('Reloading FFT data. This could take a while.')
+        if htid_test:
             assert ([path_to_htid(p) for p in numpy_paths(path, n=n_docs)] ==
                     list(htid_test))
         _cache['start'] = start
@@ -414,8 +571,36 @@ def load_embedding_fft_array(path, start=0, end=None, reload=False,
     return _cache['data']
 
 
+def load_embedding_fft_signature_array(
+        path, start=0, end=None, reload=False,
+        htid_test=False, n_docs=None, _cache={}):
+    """
+    Quickly load embedding fft signatures, using a cache if nothing about
+    the input arguments has changed.
+    """
+    reload = (reload or not _cache or _cache['start'] != start or
+              _cache['end'] != end or htid_test or
+              _cache['n_docs'] != n_docs)
+    if reload:
+        print('Reloading FFT signature data. This could take a while.')
+        if htid_test:
+            assert ([path_to_htid(p) for p in numpy_paths(path, n=n_docs)] ==
+                    list(htid_test))
+        _cache['start'] = start
+        _cache['end'] = end
+        _cache['n_docs'] = n_docs
+        _cache['data'] = numpy.array(
+                [flatten_fft(load_compact_fft_as_signature(f), start, end)
+                 for f in numpy_paths(path, n=n_docs)])
+    return _cache['data']
+
+
 def load_metadata(metadata_path, fft_path, csv_delim='\t', htid_col='htid',
                   n_docs=None):
+    """
+    Load the metadata for the volumes loaded by
+    `load_embedding_fft_array`.
+    """
     ids = [path_to_htid(p)
            for p in numpy_paths(fft_path, n=n_docs)]
     metadata = (pandas
@@ -425,53 +610,259 @@ def load_metadata(metadata_path, fft_path, csv_delim='\t', htid_col='htid',
     return metadata.reindex(ids, fill_value='[metadata missing]')
 
 
-def load_fft_metadata(fft_path, metadata_path, start=0, end=None, reload=False,
-                      csv_delim='\t', htid_col='htid', n_docs=None):
+def load_fft_metadata(fft_path, metadata_path, start=0, end=None,
+                      reload=False, csv_delim='\t', htid_col='htid',
+                      htid_test=False, n_docs=None):
+    """
+    Load an array of embedding fft data and the corresponding metadata,
+    returning both together.
+    """
     metadata = load_metadata(metadata_path, fft_path,
                              csv_delim, htid_col, n_docs=n_docs)
-    fft_arr = load_embedding_fft_array(fft_path, start, end,
-                                       reload, metadata.index, n_docs=n_docs)
+    htid_test = metadata.index if htid_test else False
+    fft_arr = load_embedding_fft_array(fft_path, start, end, reload,
+                                       htid_test=htid_test, n_docs=n_docs)
+
     return fft_arr, metadata
 
 
+def load_fft_signature_metadata(
+        fft_path, metadata_path, start=0, end=None, reload=False,
+        csv_delim='\t', htid_col='htid', htid_test=False, n_docs=None):
+    """
+    Load an array of embedding fft signature data and the corresponding
+    metadata, returning both together.
+    """
+    metadata = load_metadata(metadata_path, fft_path,
+                             csv_delim, htid_col, n_docs=n_docs)
+    htid_test = metadata.index if htid_test else False
+    fft_arr = load_embedding_fft_signature_array(
+            fft_path, start, end, reload, htid_test=htid_test, n_docs=n_docs)
+
+    return fft_arr, metadata
+
+
+def complex_blob(n, scale=1.0, seed=0):
+    """
+    Sample `n` values from a 2-d normal distribution and represent the
+    result as a vector of complex numbers. When plotted on the imaginary
+    plane, this looks like a blob; hence the name.
+    """
+    rng = numpy.random.default_rng(seed)
+    blob = rng.multivariate_normal(
+        [0, 0], [[scale ** 2, 0], [0, scale ** 2]], n
+    )
+    x, y = blob.T
+    return x + y * 1j
+
+
+def stable_random_hermitian_matrix(reduce, full):
+    """
+    Generate a fixed random projection matrix for the given size. By
+    reseeding the rng for each row / transposed column, we guarantee
+    that the first (r, c) rows and columns will always be identical.
+
+    This will be a random hermitian matrix, meaning that the diagonals
+    are sampled from a standard normal distribution over the reals,
+    the off-diagonals are sampled from the standard normal distribution
+    distribution over the complex numbers (i.e. a bivariate normal
+    distribution such that (x, y) -> (x + y * i)) and the final
+    matrix is equal to its own cojugate transpose (so we fill the
+    lower triangle with the transpose of the upper triangle).
+
+    This approach turns out not to generate a unitary matrix, which
+    in practice means that it "zooms" toward or away from the data.
+    We tried a simplistic approach to fixing this problem -- dividing
+    by the zoom factor -- and it worked well enough.
+
+    However, it has no particularly strong mathematical justification,
+    and although it is easier to explain in simple language what it
+    does, it actually makes things more complicated.
+
+    In the end, we chose an approach that is simpler, and has a
+    stronger mathematical justification. However, the justification
+    is more abstract, and so harder to communicate.
+    """
+
+    # A bit wasteful, but we just fill the whole matrix with
+    # random complex numbers first. Because we supply a seed
+    # every time the result is both (psudo-)random and deterministic.
+    rhm = numpy.zeros((full, full), dtype=numpy.complex128)
+    for i in range(full):
+        rhm[i, :] = complex_blob(full, seed=i)
+
+    # Then we zero out the lower triangle of the matrix, including
+    # the diagonal...
+    rhm = numpy.triu(rhm, k=1)
+    # And fill it with the conjugate transpose of the upper triangle...
+    rhm += rhm.conjugate().T
+    # And finaly fill the diagonal with real random values...
+    rhm[numpy.diag_indices_from(rhm)] = complex_blob(full, seed=full).real
+
+    # Look at how much the matrix lengthens or shortens vectors.
+    test_vecs = numpy.array([complex_blob(full) for i in range(10)]).T
+    test_transformed = rhm @ test_vecs
+
+    # Calculate the increase in magnitude caused by this
+    # transformation on a few differetn vectors -- call it the
+    # "inflation ratio" -- and take the mean. (Won't a matrix change
+    # the length of any vector by the same amount, proprtionally
+    # speaking? So do we really need to try it out on multiple
+    # vectors? But we do because while it might not be necessary,
+    # it also doesn't hurt much.)
+    inflation_ratio = (magnitude(test_transformed, axis=0) /
+                       magnitude(test_vecs, axis=0))
+    mean_inflation_ratio = inflation_ratio.mean()
+
+    # Now divide by the mean inflation ratio.
+    rhm /= mean_inflation_ratio
+
+    # Finally, we drop all but the first `reduce` rows. We've wasted
+    # a bit of time generating the full matrix, but for now
+    # the added complexity of filling only the first `reduce`
+    # rows is not worth taking on yet.
+    reduced_rhm = rhm[0:reduce, :]
+    return reduced_rhm
+
+
+def stable_random_haar_measure_matrix(reduce, full):
+    """
+    Generate a random matrix "distributed with Haar measure."
+    Very closely modeled on code from this article:
+
+    http://www.ams.org/notices/200705/fea-mezzadri-web.pdf
+
+    I don't know much about the meaning of "Haar measure." But
+    I know that it means the matrix is unitary.
+
+    Unitary matrices preserve lengths and angles between vectors.
+    In other words, if you take two vectors and transform them
+    with a unitary matrix, their lengths won't change, and the
+    angle between them won't change. These are nice properties
+    for a dimension reduction matrix to have.
+
+    So this function selects a random matrix from among all
+    those that have this property. (It may also constrain them
+    to have some other properties -- I'm not sure.)
+
+    Also, for a given pair of `reduce` and `full` arguments,
+    this function always selects the same "random" matrix. That
+    is, the matrix is random in the sense that it is arbitrarily
+    chosen, but it's also stable -- for any given input, this
+    function will always return the same output.
+
+    This ensures that the the signature for a given volume is
+    always the same, and we can compare signatures generated
+    at different times and places.
+    """
+
+    z = numpy.zeros((full, full), dtype=numpy.complex128)
+    for i in range(full):
+        z[i, :] = complex_blob(full, seed=i)
+
+    q, r = numpy.linalg.qr(z)
+    d = numpy.diagonal(r)
+    ph = d / numpy.absolute(d)
+    q = numpy.multiply(q, ph, q)
+
+    reduced_q = q[0:reduce, :]
+    return reduced_q
+
+
+def vector_magnitude(vec, axis=None):
+    """
+    Calculate the mangitude of a real vector. If axis is provided,
+    vec is treated as an array of vectors and reduced along the
+    given axis. This will work on arrays of any dimension.
+    """
+    return (vec * vec).sum(axis=axis) ** 0.5
+
+
+def vector_normalize(vec, axis=None):
+    """
+    Normalize a real vector. If axis is provided, vec is treated
+    as an array of vectors, and normalized along the given axis.
+    This should work for arrays of any dimension. (Test this!)
+    """
+    mag = vector_magnitude(vec, axis=axis)
+    mag = mag if mag > 0 else 1
+    if axis is None:
+        return vec / mag
+    else:
+        axis_ix = [None] * len(vec.shape)
+        axis_ix[axis] = slice(None, None, None)
+        return vec / numpy.array([mag])[axis_ix]
+
+
+def complex_magnitude(c):
+    """
+    Calculate the mangitude of a complex number or array of complex
+    numbers. In the case of an array, this returns an array of the
+    same shape as the input containing the magnitude of each complex
+    number.
+    """
+    return (c * c.conjugate()) ** 0.5
+
+
+def complex_normalize(c):
+    """
+    Normalize a complex number or array of complex numbers. In the
+    case of an array of complex numbers, this returns an array of
+    the same shape as the input containing normalized (unit-magnitude)
+    complex numbers.
+    """
+    mag = complex_magnitude(c)
+    mag = mag if mag > 0 else 1
+    return c / mag
+
+
+def magnitude(complex_vec, axis=None):
+    """
+    This does some extra work, but is fully generalized -- i.e.
+    it correctly caclulates the magnitude of any vector, complex
+    or real. See `vector_magnitude` for the behavior of the
+    `axis` paramter.
+    """
+    cv_mag_vector = complex_magnitude(complex_vec)
+    return vector_magnitude(cv_mag_vector, axis=axis)
+
+
+def normalize(complex_vec, axis=None):
+    """
+    Like magnitude, this does extra work, but correctly
+    normalizes both complex and real vectors. See `vector_magnitude`
+    for the behavior of the `axis` parameter.
+    """
+    cv_mag_vector = complex_magnitude(complex_vec)
+    return vector_normalize(cv_mag_vector, axis=axis)
+
+
 class PhasorSignature:
+    """
+    A class that stores state for the purpose of generating signature
+    vectors based on longer input vectors. The resulting signatures are
+    substantially smaller than the input vectors, but as useful or even
+    more useful for the purpose of deduplication.
+    """
     def __init__(self, *, n_components=10, n_anchors=3):
         self.n_components = n_components
         self.n_anchors = n_anchors
-        self.scaler = StandardScaler()
         self._argshuf = []
+        self._reduce = stable_random_haar_measure_matrix(
+            self.n_complex_components, 300
+            )
 
-    def stable_shuffle(self, seq):
+    @property
+    def n_complex_components(self):
         """
-        Choose a random permutation based on the input length of the
-        seuqence, and apply that permutation to all inputs of that length.
-        Should be stable across runs, but not guaranteed to be stable
-        across numpy versions. (TODO: Fix that.)
+        The number of complex components required to store
+        `self.n_components` real values. When `self.n_components` is
+        even, this will be exactly `self.n_components / 2`. When it
+        is odd, it will be the first integer larger than
+        `self.n_components / 2`. The final imaginary part of the
+        last component will be superfluous.
         """
-        seq = numpy.asarray(seq)
-        if len(seq) != len(self._argshuf):
-            # Reset the rng using seq length as the seed.
-            # Why not just use the same seed every time? Dunno.
-            rng = numpy.random.default_rng(len(seq))
-            # Save the first permutation generated thereby.
-            self._argshuf = rng.permutation(len(seq))
-        return seq[self._argshuf]
-
-    def mag(self, c):
-        return (c * c.conjugate()) ** 0.5
-
-    def norm(self, c):
-        mag = self.mag(c)
-        mag = mag if mag > 0 else 1
-        return c / mag
-
-    def n_centroids(self, phasors, n):
-        phasors = self.stable_shuffle(phasors)
-        centroids = []
-        for start in range(n):
-            span = [phasors[i] for i in range(start, len(phasors), n)]
-            centroids.append(sum(span) / len(span))
-        return centroids
+        return self.n_components // 2 + (self.n_components % 2)
 
     def signature(self, phasors):
         """
@@ -486,14 +877,17 @@ class PhasorSignature:
         can describe them in terms of two distinct actions on the
         blob: rotation and perturbation.
 
-        The rotation is caused by the addition of front- and end-matter.
-        Those additions shift the bulk of the body text forward or
-        backward, and phasors represent that shift as a rotation.
-        So our phasor blob rotates around the origin as front- and
-        end-matter is added.
+        The rotation is caused by the addition of front- and
+        end-matter. Those additions shift the bulk of the body text
+        forward or backward, and phasors represent that shift as a
+        rotation. So our phasor blob rotates around the origin as
+        front-matter is added, and then rotates back the other
+        direction as end-matter is added. When these additions
+        balance each other out, the net rotation is zero. (It's
+        not clear how often this happens, empirically speaking.)
 
-        The perturbation is caused by error of various kinds, and by
-        the content of the front- and end-matter. These textual
+        The perturbation is caused by errors of various kinds, and
+        by the content of the front- and end-matter. These textual
         variations slightly modify the way the Fourier transform
         breaks down the semantic structure of the documents.
         The result is that the phasors get bumped about a bit.
@@ -528,55 +922,127 @@ class PhasorSignature:
 
         Some strategies to test:
 
-          maybe a single outlier can just be the anchor
-          maybe it should be just another stable choice, not necessarily
-            outliers
-          maybe we should be averaging together points at every
+          Maybe a single outlier can be the anchor.
+            (update: No. This didn't work as well. Three seems
+             to be the magic number, but this is a parameter now.)
+          Maybe we can find an alternative to using outliers as our
+            anchor points.
+            (update: No. At least not yet. We have not come up with
+             any good alternatives.)
+          Maybe we should be averaging together points at every
             step -- not just at the anchor step but for each signature
-            dimension
-          maybe there are properties of the individual semantic
-            dimensions that make them better or worse suited for
-            this
-
-
+            dimension.
+            (update: No. We currently do random projection instead,
+             which effectively averages all points togeter with
+             different weights. However, we did try this, and it
+             also worked reasonably well. Note that it is roughly
+             equivalent to projection with a random binary matrix.)
+          Maybe there are properties of individual semantic
+            dimensions that would make them better or worse anchors.
+            (update: We still have no idea about this!)
         """
         phasors = phasors.reshape(-1)
 
-        top_mag = sorted(phasors, key=self.mag)[-self.n_anchors:]
+        top_mag = sorted(phasors, key=complex_magnitude)[-self.n_anchors:]
         centroid = sum(top_mag) / self.n_anchors
-        offset = self.norm(centroid)
+        offset = complex_normalize(centroid)
         offset = 1 if offset == 0 else offset
+        sig_offset = phasors / offset
 
-        signature = [c / offset for c in phasors]
-        signature = self.n_centroids(signature, self.n_components // 2 + 1)
-        signature = [x for c in signature for x in (c.real, c.imag)]
-        return numpy.array(signature[:self.n_components])
+        # sig_centroids = self.n_centroids(sig_offset)
+        sig_rand = self.rand_reduce(sig_offset)
+
+        signature = numpy.empty(len(sig_rand) * 2)
+        signature[::2] = sig_rand.real
+        signature[1::2] = sig_rand.imag
+        return signature[:self.n_components]
+
+    def stable_shuffle(self, seq):
+        """
+        Choose a random permutation based on the input length of the
+        seuqence, and apply that permutation to all inputs of that length.
+        Should be stable across runs, but not guaranteed to be stable
+        across numpy versions. (TODO: Fix that, if possible.)
+        """
+        seq = numpy.asarray(seq)
+        if len(seq) != len(self._argshuf):
+            # Reset the rng using seq length as the seed.
+            # Why not just use the same seed every time? Dunno.
+            rng = numpy.random.default_rng(len(seq))
+            # Save the first permutation generated thereby.
+            self._argshuf = rng.permutation(len(seq))
+        return seq[self._argshuf]
+
+    def n_centroids(self, phasors):
+        n = self.n_complex_components
+        phasors = self.stable_shuffle(phasors)
+        centroids = []
+        for start in range(n):
+            span = [phasors[i] for i in range(start, len(phasors), n)]
+            centroids.append(sum(span) / len(span))
+        return numpy.array(centroids)
+
+    def rand_reduce(self, phasors, nan_debug=False):
+        full = len(phasors)
+        reduce = self.n_complex_components
+        if self._reduce.shape != (reduce, full):
+            self._reduce = stable_random_haar_measure_matrix(reduce, full)
+        result = self._reduce @ phasors
+
+        if nan_debug:
+            nan_indices = numpy.isnan(result)
+            if nan_indices.any():
+                print(numpy.where(nan_indices))
+                ix = numpy.where(nan_indices) + (Ellipsis,)
+                print(self._reduce[ix] @ phasors)
+                print(numpy.isnan(self._reduce[ix]).any())
+
+        return result
 
     def fit_transform(self, data):
-        signatures = self._transform_unscaled(data)
-        return self.scaler.fit_transform(signatures)
+        """
+        This model is stateless, so there is nothing to fit.
+        Just return the signature transform.
+        """
+        return self.transform(data)
 
     def fit(self, data):
-        self.fit_transform(data)
+        """This model is stateless, so there is nothing to fit."""
         return self
 
-    def _transform_unscaled(self, data):
+    def transform(self, data):
+        """Calculate the signature of the given data."""
         unflattened = [unflatten_vec(d) for d in data]
         return numpy.array([self.signature(uf)
                             for uf in unflattened])
-
-    def transform(self, data):
-        signatures = self._transform_unscaled(data)
-        return self.scaler.transform(signatures)
 
 
 class Deduplicator:
     def __init__(self, data, random=False, signature=False, **umap_kwargs):
         if isinstance(data, Deduplicator):
-            self.n_trees = data.n_trees
-            self.n_points = data.n_points
-            self.data = list(data.data)
-            self.data_umap = list(data.data_umap)
+            # Create a shallow copy of the input Deduplicator. The
+            # lists of data (`data_reduced` and `data_kd`) will be
+            # unique to the new object, but the underlying numpy
+            # arrays will be shared.
+
+            # We store two different representations of the input
+            # data here. The first is the dimension-reduced data,
+            # as derived from one of the available sklearn or
+            # sklearn-like dimension reduction models.
+
+            # The second is the same data, but inserted into a
+            # kd_tree for (reasonably) efficient nearest-neighbor
+            # queries. (Someday perhaps we will use some other
+            # NN query approach, such as that provided by the
+            # pynndescent library. But for now kd_trees are good
+            # enough.)
+
+            # We used to store the original data here as well, but
+            # it wasn't being used, took up a lot of memory, and
+            # prevented us from using pre-reduced data to create
+            # new Deduplicator objects. So we stopped.
+
+            self.data_reduced = list(data.data_reduced)
             self.data_kd = list(data.data_kd)
         else:
             if random or signature:
@@ -589,10 +1055,11 @@ class Deduplicator:
                 # But that function dutifully issues warnings every
                 # time our oddball HathiTrust data causes numerical
                 # issues, and those warnings clutter up our notebooks.
-                data_norm = data - data.mean(axis=0)
-                data_std = data_norm.std(axis=0)
-                data_std[data_std == 0] = 1
-                data_norm = data_norm / data_std
+                if len(data) > 0:
+                    data_norm = data - data.mean(axis=0)
+                    data_std = data_norm.std(axis=0)
+                    data_std[data_std == 0] = 1
+                    data_norm = data_norm / data_std
 
                 if random:
                     model = GaussianRandomProjection
@@ -601,25 +1068,78 @@ class Deduplicator:
             else:
                 model = umap.UMAP
 
-            self.n_trees = 1
-            self.n_points = len(data)
-            self.data = [data]
-            self.data_umap = [model(**umap_kwargs).fit_transform(d)
-                              for d in self.data]
-            self.data_kd = [cKDTree(d) for d in self.data_umap]
+            if len(data) > 0:
+                # Merged Deduplicator objects may contain more than one
+                # batch of data, so these are lists. But upon initial
+                # object creation, there is just one batch of data.
+                self.data_reduced = [model(**umap_kwargs).fit_transform(data)]
+                self.data_kd = [cKDTree(self.data_reduced[0])]
+            else:
+                self.data_reduced = []
+                self.data_kd = []
+
+    @classmethod
+    def from_reduced(cls, data, random=False, signature=False, **umap_kwargs):
+        """
+        Create a new Deduplicator from data that has already been
+        dimension-reduced. The signature is identical to the normal
+        constructor for the sake of consistency.
+        """
+        new = Deduplicator([], random=random, signature=signature,
+                           **umap_kwargs)
+        new.data_reduced = [data]
+        new.data_kd = [cKDTree(new.data_reduced[0])]
+
+        return new
+
+    @property
+    def n_trees(self):
+        """
+        The number of trees in the Deduplicator.
+        """
+        return len(self.data_kd)
+
+    @property
+    def n_points(self):
+        """
+        Deduplicator objects may store multiple representations of the
+        points they contain, but they always contain the same points,
+        so `n_points` will always be equal to the number of rows in
+        any of the matrices stored in `self.data_reduced`.
+
+        However, it is possible to pass in data of length zero to the
+        constructor, in which case the Deduplicator is empty. In that
+        case, there are no matrices stored in `self.data_reduced`, so
+        we return zero.
+        """
+
+        if self.data_reduced:
+            return len(self.data_reduced[0])
+        else:
+            return 0
 
     def merge(self, other):
+        """
+        Combine two Deduplicators. The resulting merged Deduplicator
+        contains all the KD trees and reduced datasets from the two
+        inputs.
+
+        When consulted, the merged Deduplicator returns points that
+        appear in *all* the KD trees it contains.
+        """
         if other.n_points != self.n_points:
             raise ValueError(
                 'Deduplicator size mismatch: '
                 f'{self.n_points} != {other.n_points}'
             )
-        self.data.extend(other.data)
-        self.data_umap.extend(other.data_umap)
+        self.data_reduced.extend(other.data_reduced)
         self.data_kd.extend(other.data_kd)
-        self.n_trees += other.n_trees
 
     def _get_pairs_simple(self, distance):
+        """
+        A simple private deduplication routine. Slow -- use only for
+        testing.
+        """
         pairs = self.data_kd[0].query_pairs(distance)
         pairs = set(frozenset(p) for p in pairs)
         for kd in self.data_kd[1:]:
@@ -629,17 +1149,23 @@ class Deduplicator:
         return pairs
 
     def _get_pairs_onebatch(self, distance, batch):
-        data_umap = self.data_umap[0]
+        """
+        A pair-finding routine that operates batchwise, for speed.
+        Each item in each batch is tested against all items in all
+        KD trees, and the resulting pairs are aggregated in
+        `_get_pairs_batched`.
+        """
+        data_reduced = self.data_reduced[0]
         data_kd = self.data_kd[0]
-        pairs = data_kd.query_ball_point(data_umap[batch], distance)
+        pairs = data_kd.query_ball_point(data_reduced[batch], distance)
         pairs = set(frozenset((i, m)) for
                     i, matches in zip(batch, pairs)
                     for m in matches
                     if m != i)
         for t in range(1, self.n_trees):
-            data_umap = self.data_umap[t]
+            data_reduced = self.data_reduced[t]
             data_kd = self.data_kd[t]
-            newpairs = data_kd.query_ball_point(data_umap[batch], distance)
+            newpairs = data_kd.query_ball_point(data_reduced[batch], distance)
             newpairs = set(frozenset((i, m)) for
                            i, matches in zip(batch, newpairs)
                            for m in matches
@@ -649,6 +1175,9 @@ class Deduplicator:
         return pairs
 
     def _get_pairs_batched(self, distance, batchsize=1000):
+        """
+        Aggregate the pairs generated by `_get_pairs_onebatch`.
+        """
         indices = range(0, self.n_points)
         batches = [list(indices[i: i + batchsize])
                    for i in range(0, self.n_points, batchsize)]
@@ -658,11 +1187,25 @@ class Deduplicator:
         return pairs
 
     def __call__(self, distance):
+        """
+        Run the full pair-finding routine. Currently the only public
+        pair-finding interface.
+        """
         # return self._get_pairs_simple(distance)
         return self._get_pairs_batched(distance)
 
 
-def deduplicator_balltree(data, **umap_kwargs):
+def _deduplicator_balltree(data, **umap_kwargs):
+    """
+    An extremely simple deduplicator for testing the `BallTree`
+    data structure provided by `sklearn.neighbors`, as an alternative
+    to standard KD tree structures. `BallTree`s may perform better on
+    high-dimensional data, but were less effective than KD trees
+    in our initial tests.
+
+    No longer public (hence the leading underscore), but preserved
+    here as a record of some of our preliminary work.
+    """
     data_umap = umap.UMAP(**umap_kwargs).fit_transform(data)
     data_kd = BallTree(data_umap)
 
@@ -674,13 +1217,24 @@ def deduplicator_balltree(data, **umap_kwargs):
     return deduplicate
 
 
-def umap_concat(data, **umap_kwargs):
+def _umap_concat(data, **umap_kwargs):
+    """
+    A simple approach to creating signatures by concatenating the
+    outputs of multiple UMAP models. Not very successful.
+
+    No longer public (hence the leading underscore), but preserved
+    here as a record of some of our preliminary work.
+    """
     data_tiles = []
     for i in range(5):
         data_i = slice_vec_bands(data, start=i, end=i + 1)
         data_tiles.append(umap.UMAP(**umap_kwargs).fit_transform(data_i))
-    data_concat = numpy.empty((data_tiles[0].shape[0], sum(dt.shape[1]
-                              for dt in data_tiles)))
+
+    data_concat = numpy.empty((
+        data_tiles[0].shape[0],
+        sum(dt.shape[1] for dt in data_tiles)
+    ))
+
     start_col = 0
     for dt in data_tiles:
         end_col = start_col + dt.shape[1]
@@ -691,27 +1245,27 @@ def umap_concat(data, **umap_kwargs):
 
 
 def string_similarity(a, b):
+    """A readable shortcut for the SequenceMatcher ratio method."""
     return SequenceMatcher(a=a, b=b).ratio()
 
 
 def show_dataset(folder, n=10):
+    """
+    Show a few hundred characters from the first page of the first
+    `n` volumes in a folder.
+    """
     volumes = volume_paths(folder)
-    for v in volumes:
+    for i, v in enumerate(volumes):
         print(load_pages(v)[0][0:500])
-
-
-# def show_umap(data, n_neighbors=20, min_dist=0.001, metric='euclidean'):
-#     um = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, metric=metric)
-#     vis = um.fit_transform(data)
-#     plt.gca().axis('equal')
-#     plt.scatter(vis[:, 0],
-#                 vis[:, 1],
-#                 c=[i / len(vis) for i in range(len(vis))],
-#                 cmap='plasma')
-#     plt.show()
+        if i >= n:
+            break
 
 
 def umap_color(metadata, color_field, n_colors, dtype=None, palette=magma):
+    """
+    A helper function used by `show_umap_bokeh` to build an array of
+    color data for use by Bokeh.
+    """
     palette = palette(n_colors)
     if color_field is None:
         metadata_cf = metadata
@@ -729,6 +1283,11 @@ def umap_color(metadata, color_field, n_colors, dtype=None, palette=magma):
 
 def show_umap_bokeh(data, metadata, color_field=None,
                     n_neighbors=10, min_dist=0.001, metric='euclidean'):
+    """
+    Generate a Bokeh scatterplot based on a UMAP model. Colors points
+    based on the metadata field indicated by `color_field`. If no
+    color field is provided, a third UMAP dimension is used instead.
+    """
     if color_field is None:
         dims = 3
     else:
@@ -742,6 +1301,7 @@ def show_umap_bokeh(data, metadata, color_field=None,
         color_field = "Third UMAP dimension"
     else:
         color = umap_color(metadata, color_field, 20, dtype=int)
+
     scatter_data = pandas.DataFrame({
         'umap_1': vis[:, 0],
         'umap_2': vis[:, 1],
