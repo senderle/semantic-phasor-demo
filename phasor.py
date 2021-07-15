@@ -295,7 +295,7 @@ def embedding_fft(sp_embedding, n_bands=N_BANDS):
     Perform a Fourier transform on all the dimensions of an
     array of word embeddings extracted from a document.
     `sp_embedding` is assumed to be an array with a row
-    for each document, and a column for each dimension of
+    for each token, and a column for each dimension of
     the underlying word embedding vector model.
     """
     fft_cols = []
